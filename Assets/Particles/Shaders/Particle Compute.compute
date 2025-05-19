@@ -1,0 +1,173 @@
+#pragma kernel UpdateRoot
+#pragma kernel Process
+#pragma kernel GenerateMesh
+
+#define TWO_PI 6.28318530718
+
+#include "./inc/structs.hlsl"
+#include "./inc/sdf.hlsl"
+
+RWStructuredBuffer<Particle> Particles;
+AppendStructuredBuffer<Triangle> Triangles;
+float Time;
+float DeltaTime;
+float3 RootOffset;
+int PipeSegments;
+
+float3x3 GetParticleTBN(in Particle p)
+{
+    float3 UP = float3(0.01, 0.985, -0.015);
+
+    /*
+    if (abs(dot(UP, p.direction)) > 0.97)
+        UP = float3(-1, 0, 0);
+    */
+
+    float3x3 tbn;
+    tbn[0] = p.direction;
+    //tbn[1] = normalize(cross(tbn[0], UP));
+    tbn[1] = p.normal;
+    tbn[2] = cross(tbn[0], tbn[1]);
+
+    return tbn;
+}
+
+void UpdateParticle(inout Particle p, in Particle parent)
+{
+    float stiffness = 0;
+    float3 gravity = float3(0, -9.81, 0);
+
+    float angle = (Time * p.random.x * 1.0) + (p.random.y * TWO_PI);
+    float3 side = float3(sin(angle), 0, cos(angle)) * p.random.z * 4.0;
+    side = 0.0;
+
+    /*
+    float inertia = 100.0;
+    inertia *= DeltaTime;
+
+    //p.velocity *= lerp(1.0, inertia, DeltaTime);
+    if (length(p.velocity) < inertia)
+        p.velocity = 0;
+    else
+        p.velocity -= normalize(p.velocity) * inertia;
+    */
+
+    p.position += (p.velocity + gravity + side) * DeltaTime;
+
+    p.direction = normalize(parent.position - p.position);
+
+    //float c = dot(parent.direction, p.direction);
+    //p.direction = lerp(p.direction, parent.direction, (1.0 - c) * DeltaTime * stiffness);
+    p.position = parent.position - p.direction * p.distance;
+
+    p.normal = lerp(p.normal, parent.normal, DeltaTime * 4.0);
+    p.normal = normalize(cross(p.direction, cross(p.direction, p.normal)));
+}
+
+void UpdateCollision(inout Particle p, in Particle parent)
+{
+    float sd = GetSignedDistance(p.position);
+    p.debug = sd - p.radius * 1.01;
+
+    if (sd >= p.radius)
+        return;
+
+    float3x3 tbn = GetParticleTBN(p);
+    float3 separation = GetSDFSeparationDirection(p.position, sd, tbn);
+    float len = sd - p.radius;
+
+    float factor = (-len) / p.radius;
+    len *= saturate(factor);
+    
+    p.position -= separation * len;
+    //p.velocity -= separation * len;
+
+}
+
+float3 GetParticleNormal(in float3x3 tbn, float angle)
+{
+    return normalize(sin(angle) * tbn[1] + cos(angle) * tbn[2]);
+}
+
+
+[numthreads(64, 1, 1)]
+void UpdateRoot(uint3 id : SV_DispatchThreadID)
+{
+    Particle p = Particles[id.x];
+
+    if (p.parent < 0)
+    {
+        p.position = p.origin + RootOffset;
+    }
+    
+    Particles[id.x] = p;
+}
+
+[numthreads(64, 1, 1)]
+void Process(uint3 id : SV_DispatchThreadID)
+{
+    Particle p = Particles[id.x];
+
+    if (p.parent >= 0)
+    {
+        Particle parent = Particles[p.parent];
+        UpdateParticle(p, parent);
+        UpdateCollision(p, parent);
+    }
+
+    Particles[id.x] = p;
+}
+
+[numthreads(64, 1, 1)]
+void GenerateMesh(uint3 id : SV_DispatchThreadID)
+{
+    Particle p = Particles[id.x];
+
+    if (p.parent >= 0)
+    {
+        Particle parent = Particles[p.parent];
+
+        float3x3 pTBN = GetParticleTBN(p);
+        float3x3 parentTBN = GetParticleTBN(parent);
+
+        for (int i = 0; i < PipeSegments; i++)
+        {
+            float x1 = float(i) / float(PipeSegments);
+            float x2 = float(i + 1) / float(PipeSegments);
+
+            float r1 = x1 * TWO_PI;
+            float r2 = x2 * TWO_PI;
+
+            float3 n1 = GetParticleNormal(pTBN, r1);
+            float3 n2 = GetParticleNormal(pTBN, r2);
+            float3 n3 = GetParticleNormal(parentTBN, r1);
+            float3 n4 = GetParticleNormal(parentTBN, r2);
+
+            Triangle t1 = (Triangle)0;
+            Triangle t2 = (Triangle)0;
+
+            t1.position[0] = p.position + n1 * p.radius;
+            t1.position[2] = p.position + n2 * p.radius;
+            t1.position[1] = parent.position + n3 * parent.radius;
+            t1.normal[0] = n1;
+            t1.normal[2] = n2;
+            t1.normal[1] = n3;
+            t1.uv[0] = float2(x1, p.segment);
+            t1.uv[2] = float2(x2, p.segment);
+            t1.uv[1] = float2(x1, parent.segment);
+
+            t2.position[0] = t1.position[1];
+            t2.position[1] = parent.position + n4 * parent.radius;
+            t2.position[2] = t1.position[2];
+            t2.normal[0] = t1.normal[1];
+            t2.normal[1] = n4;
+            t2.normal[2] = t1.normal[2];
+            t2.uv[0] = t1.uv[1];
+            t2.uv[1] = float2(x2, parent.segment);
+            t2.uv[2] = t1.uv[2];
+
+            Triangles.Append(t1);
+            Triangles.Append(t2);
+        }
+    }
+}
